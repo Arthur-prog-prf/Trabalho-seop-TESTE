@@ -1,22 +1,26 @@
 import { Officer, MissionType, UnitType, SelectionConfig, SelectionResult, AuditLog, SheetData } from '../types';
 import { SPECIAL_GROUPS } from '../constants';
 
-// --- Helpers ---
+// --- Helpers de Utilidade ---
 
+/**
+ * Converte strings de data ou números do Excel para objetos Date.
+ * Lida com o formato brasileiro DD/MM/YYYY.
+ */
 const safeDate = (dStr: string | number | undefined): Date | null => {
     if (dStr === undefined || dStr === null) return null;
     
-    // Excel might return a number (days since 1900)
     if (typeof dStr === 'number') {
         const d = new Date(Math.round((dStr - 25569) * 86400 * 1000));
         return isNaN(d.getTime()) ? null : d;
     }
 
     if (typeof dStr === 'string') {
-        if (dStr.trim() === '') return null;
-        // Handle DD/MM/YYYY format
-        if (dStr.includes('/')) {
-            const parts = dStr.split('/');
+        const cleanStr = dStr.trim();
+        if (cleanStr === '') return null;
+        
+        if (cleanStr.includes('/')) {
+            const parts = cleanStr.split('/');
             if (parts.length === 3) {
                 const day = parseInt(parts[0], 10);
                 const month = parseInt(parts[1], 10) - 1; 
@@ -25,14 +29,27 @@ const safeDate = (dStr: string | number | undefined): Date | null => {
                 return isNaN(d.getTime()) ? null : d;
             }
         }
-        // Handle ISO
-        const d = new Date(dStr);
+        const d = new Date(cleanStr);
         return isNaN(d.getTime()) ? null : d;
     }
     return null;
 };
 
-// Returns the max date from a list of values (Logic for View 3)
+/**
+ * Limpa e converte valores numéricos da planilha para Float.
+ * Lida com separadores de milhar e decimais (converte vírgula para ponto).
+ */
+const parsePFRNumber = (val: any): number => {
+    if (val === undefined || val === null || val === '') return 0;
+    if (typeof val === 'number') return val;
+    const cleanVal = String(val).replace(/\s/g, '').replace(',', '.');
+    const parsed = parseFloat(cleanVal);
+    return isNaN(parsed) ? 0 : parsed;
+};
+
+/**
+ * Calcula a data mais recente entre várias colunas de data (Lógica da Visão 3).
+ */
 const calculateRecency = (dates: (string | number | undefined)[]): Date | null => {
     let max: Date | null = null;
     dates.forEach(dVal => {
@@ -45,15 +62,14 @@ const calculateRecency = (dates: (string | number | undefined)[]): Date | null =
 };
 
 /**
- * Normalizes an object's keys to lowercase to ensure case-insensitive column matching.
- * Also trims values if they are strings.
+ * Normaliza as chaves das linhas para minúsculas e sem acentos.
+ * Garante que 'Matrícula' e 'matricula' sejam lidas como o mesmo campo.
  */
 const normalizeRow = (row: Record<string, any>): Record<string, any> => {
     const newRow: Record<string, any> = {};
     Object.keys(row).forEach(key => {
         const cleanKey = key.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
         let value = row[key];
-        // Trim string values to avoid matching issues
         if (typeof value === 'string') {
             value = value.trim();
         }
@@ -62,63 +78,55 @@ const normalizeRow = (row: Record<string, any>): Record<string, any> => {
     return newRow;
 };
 
-// --- Core Data Pipeline ---
+// --- Pipeline Principal de Dados ---
 
 export const mergeData = (inputs: SheetData): Officer[] => {
-    // 1. Normalize all inputs for case-insensitive column access
+    // 1. Normalização das entradas
     const opsData = inputs.operacional.map(normalizeRow);
     const origemData = inputs.origem.map(normalizeRow);
     const externaData = inputs.externas.map(normalizeRow);
     const restricaoData = inputs.restricoes.map(normalizeRow);
 
-    // 2. Index auxiliary tables by 'Matrícula' (Primary Key)
+    // 2. Indexação e Criação de Conjuntos de Busca (Map/Set)
+    // CRÍTICO: String() e trim() garantem que a matrícula seja comparada corretamente.
     const origemMap = new Map(origemData.map(i => [String(i['matricula'] || '').trim(), i]));
     const missionMap = new Map(externaData.map(i => [String(i['matricula'] || '').trim(), i]));
-    const restrictionSet = new Set(restricaoData.map(i => String(i['matricula'] || '').trim()));
+    
+    // CORREÇÃO PANE 1: Filtrar matrículas vazias para evitar restrições falsas em massa
+    const restrictedMatriculas = restricaoData
+        .map(i => String(i['matricula'] || '').trim())
+        .filter(m => m.length > 0);
+    const restrictionSet = new Set(restrictedMatriculas);
 
-    // 3. Merge Strategy - Processing the 5 Logical Views
     const officers: Officer[] = [];
 
-    // VIEW 1: Horas Operacionais (Base List)
-    // Source: Aba 'Hrs Operacionais - Frequência'
-    // Columns: Servidor, Matrícula, Lotação, Horas operacional
+    // VIEW 1: Horas Operacionais (Base: Hrs Operacionais - Frequência)
     opsData.forEach((op, index) => {
         const mat = String(op['matricula'] || '').trim();
-        if (!mat) return; // Skip empty rows
+        if (!mat) return; 
 
-        // VIEW 2: Horas de IFR (Stats)
-        // Source: Aba 'Origem'
-        // Columns: Carga Horária IFR, QTD IFR - 12h, QTD IFR - 6h
+        // VIEW 2 & 3: Dados de IFR e Recência (Fonte: Origem)
         const origem = origemMap.get(mat) || {};
-        const chIfr = parseFloat(origem['carga horaria ifr'] || '0');
-        const qtd12h = parseInt(origem['qtd ifr - 12h'] || '0');
+        const chIfr = parsePFRNumber(origem['carga horaria ifr']);
+        const qtd12h = parseInt(String(origem['qtd ifr - 12h'] || '0'), 10);
 
-        // VIEW 3: Detalhes dos IFRs (Recency)
-        // Source: Aba 'Origem'
-        // Columns: Data1, Data2, Data3, Data4
-        // Logic: Calculate max date
         const dateColumns = [origem['data1'], origem['data2'], origem['data3'], origem['data4']];
         const maxIfrDate = calculateRecency(dateColumns);
 
-        // VIEW 4: Convocações Externas (Quarantine)
-        // Source: Aba 'Convocações Externas'
-        // Columns: Data Fim
+        // VIEW 4: Histórico (Fonte: Convocações Externas)
         const mission = missionMap.get(mat);
         const lastMissionDate = safeDate(mission?.['data fim']);
         
         let inQuarantine = false;
         if (lastMissionDate) {
-            // Check 6 months (180 days) - Art. 8 da IS 16/2026
             const daysSince = (new Date().getTime() - lastMissionDate.getTime()) / (1000 * 3600 * 24);
             if (daysSince < 180) inQuarantine = true;
         }
 
-        // VIEW 5: Restrições (Exclusion)
-        // Source: Aba 'Restrições'
-        // Logic: Existence in the list implies restriction
+        // VIEW 5: Verificação de Restrição
         const isRestricted = restrictionSet.has(mat);
 
-        // --- Metadata Parsing ---
+        // Identificação de Grupo e Unidade
         const rawLotacao = (op['lotacao'] || '').toUpperCase();
         let group = '';
         SPECIAL_GROUPS.forEach(g => {
@@ -130,35 +138,25 @@ export const mergeData = (inputs: SheetData): Officer[] => {
             type = UnitType.DELEGACIA;
         }
 
+        // CORREÇÃO PANE 2: Verificação robusta de nomes de colunas (singular/plural)
+        const hOps = parsePFRNumber(op['horas operacional'] || op['horas operacionais']);
+
         officers.push({
             id: `off-${index}`,
             matricula: mat,
-            nome: op['servidor'] || op['nome'], 
+            nome: op['servidor'] || op['nome'] || 'Desconhecido', 
             unidade: rawLotacao,
             tipo_unidade: type,
             grupo_especial: group,
-            
-            // View 1 Data
-            horas_operacionais: parseFloat(op['horas operacional'] || '0'),
-            
-            // View 2 Data
+            horas_operacionais: hOps,
             carga_horaria_ifr: chIfr,
             qtd_ifr_12h: qtd12h,
-
-            // View 3 Data
             data_ultimo_ifr: maxIfrDate, 
-            
-            // Defaulting tie-breakers (Tempo/Idade not in current scope)
             tempo_cargo_dias: 0,
             idade_anos: 0,
-            
-            // View 5 Data
             restricao: isRestricted,
-
-            // View 4 Data
             data_fim_ultima_missao: lastMissionDate,
             em_quarentena: inQuarantine,
-            
             justificativa: ''
         });
     });
@@ -166,7 +164,7 @@ export const mergeData = (inputs: SheetData): Officer[] => {
     return officers;
 };
 
-// --- Sorting Algorithms ---
+// --- Algoritmos de Ordenação ---
 
 const compareDatesDesc = (a: Date | null, b: Date | null) => {
     if (!a && !b) return 0;
@@ -176,30 +174,30 @@ const compareDatesDesc = (a: Date | null, b: Date | null) => {
 };
 
 const sortRegional = (candidates: Officer[]) => {
-    // 1. Min Ops Hours (ASC)
-    // 2. Max IFR Hours (DESC) (Tie breaker)
-    // 3. Max IFR Shifts (DESC) (Tie breaker)
-    // 4. Max IFR Date (DESC) (Recency - Data_Recente_IFR)
     candidates.sort((a, b) => {
+        // 1. Menor Horas Ops (Art. 12)
         if (a.horas_operacionais !== b.horas_operacionais) return a.horas_operacionais - b.horas_operacionais; 
+        // 2. Maior IFR
         if (b.carga_horaria_ifr !== a.carga_horaria_ifr) return b.carga_horaria_ifr - a.carga_horaria_ifr; 
+        // 3. Maior QTD 12h
         if (b.qtd_ifr_12h !== a.qtd_ifr_12h) return b.qtd_ifr_12h - a.qtd_ifr_12h; 
+        // 4. Data mais recente
         return compareDatesDesc(a.data_ultimo_ifr, b.data_ultimo_ifr);
     });
 };
 
 const sortNational = (candidates: Officer[]) => {
-    // 1. Max IFR Hours (DESC)
-    // 2. Max IFR Shifts (DESC)
-    // 3. Max IFR Date (DESC) (Recency)
     candidates.sort((a, b) => {
+        // 1. Maior IFR (Art. 4)
         if (b.carga_horaria_ifr !== a.carga_horaria_ifr) return b.carga_horaria_ifr - a.carga_horaria_ifr; 
+        // 2. Maior QTD 12h
         if (b.qtd_ifr_12h !== a.qtd_ifr_12h) return b.qtd_ifr_12h - a.qtd_ifr_12h; 
+        // 3. Data mais recente
         return compareDatesDesc(a.data_ultimo_ifr, b.data_ultimo_ifr);
     });
 };
 
-// --- Ranking & Constraints ---
+// --- Execução do Ranking e Restrições de Cota ---
 
 export const runSelectionProcess = (
     allOfficers: Officer[], 
@@ -209,50 +207,47 @@ export const runSelectionProcess = (
     const selected: Officer[] = [];
     const selectedIds = new Set<string>();
     
-    // Constraint Trackers
     const unitCounts: Record<string, number> = {};
     const groupCounts: Record<string, number> = {};
 
-    // 1. Initial Filtering
+    // 1. Filtragem Inicial de Disponibilidade
     let candidates = allOfficers.filter(o => {
         if (o.restricao) {
-            logs.push({ matricula: o.matricula, nome: o.nome, status: 'skipped', reason: 'Restrição Administrativa/Médica (Visão 5)' });
+            logs.push({ matricula: o.matricula, nome: o.nome, status: 'skipped', reason: 'Filtro: Servidor consta na aba de Restrições' });
             return false;
         }
 
         if (config.missionType === MissionType.NATIONAL && o.em_quarentena) {
-            logs.push({ matricula: o.matricula, nome: o.nome, status: 'skipped', reason: 'Quarentena (< 180 dias da última missão) (Visão 4)' });
+            logs.push({ matricula: o.matricula, nome: o.nome, status: 'skipped', reason: 'Interstício: Convocado de ofício há menos de 180 dias (Art. 8º)' });
             return false;
         }
         return true;
     });
 
-    // 2. Sorting
+    // 2. Ordenação segundo o Modo de Missão
     if (config.missionType === MissionType.REGIONAL) {
         sortRegional(candidates);
     } else {
         sortNational(candidates);
     }
 
-    // Helper to add officer
+    // Helper para tentativa de adição
     const attemptAddOfficer = (off: Officer, method: 'ranking' | 'group_integrity', reason: string): boolean => {
         if (selectedIds.has(off.id)) return false;
 
-        // Unit Quota Check (2 per Delegacia, 1 per Nucleo/Secao)
+        // Regra de Cotas (Art. 7º)
         const limit = off.tipo_unidade === UnitType.DELEGACIA ? 2 : 1;
         const current = unitCounts[off.unidade] || 0;
 
         if (current >= limit) {
-             logs.push({ matricula: off.matricula, nome: off.nome, status: 'skipped', reason: `Cota Unidade (${off.unidade}) Excedida` });
+             logs.push({ matricula: off.matricula, nome: off.nome, status: 'skipped', reason: `Limite de Unidade Atingido (${off.unidade}: ${limit} vaga(s))` });
              return false;
         }
 
-        // Add
         off.justificativa = reason;
         selected.push(off);
         selectedIds.add(off.id);
         
-        // Update Trackers
         unitCounts[off.unidade] = current + 1;
         if (off.grupo_especial && SPECIAL_GROUPS.includes(off.grupo_especial)) {
             groupCounts[off.grupo_especial] = (groupCounts[off.grupo_especial] || 0) + 1;
@@ -262,7 +257,7 @@ export const runSelectionProcess = (
         return true;
     };
 
-    // 3. Selection Loop
+    // 3. Processamento do Ranking
     for (const candidate of candidates) {
         if (selected.length >= config.numVagas) break;
         if (selectedIds.has(candidate.id)) continue;
@@ -271,32 +266,12 @@ export const runSelectionProcess = (
         const dataFmt = candidate.data_ultimo_ifr ? candidate.data_ultimo_ifr.toLocaleDateString() : 'N/A';
         
         if (config.missionType === MissionType.REGIONAL) {
-            reason = `Menor Ops (${candidate.horas_operacionais}h) | IFR: ${candidate.carga_horaria_ifr}h | Último: ${dataFmt}`;
+            reason = `Menor Ops (${candidate.horas_operacionais}h) | IFR: ${candidate.carga_horaria_ifr}h | Plantão: ${dataFmt}`;
         } else {
-            reason = `Maior IFR (${candidate.carga_horaria_ifr}h) | Último: ${dataFmt}`;
+            reason = `Maior IFR (${candidate.carga_horaria_ifr}h) | Turnos 12h: ${candidate.qtd_ifr_12h} | Plantão: ${dataFmt}`;
         }
 
-        const added = attemptAddOfficer(candidate, 'ranking', reason);
-
-        if (added) {
-            // Group Integrity Logic Check
-            const grp = candidate.grupo_especial;
-            if (grp && SPECIAL_GROUPS.includes(grp) && groupCounts[grp] === 2) {
-                const teamMates = candidates.filter(c => 
-                    c.grupo_especial === grp && 
-                    !selectedIds.has(c.id)
-                );
-
-                let addedMates = 0;
-                for (const mate of teamMates) {
-                    if (addedMates >= 2) break; 
-                    if (selected.length >= config.numVagas) break; 
-
-                    const forced = attemptAddOfficer(mate, 'group_integrity', `Integridade de Equipe ${grp} (Art. 5º)`);
-                    if (forced) addedMates++;
-                }
-            }
-        }
+        attemptAddOfficer(candidate, 'ranking', reason);
     }
 
     return { selected, auditLogs: logs };
