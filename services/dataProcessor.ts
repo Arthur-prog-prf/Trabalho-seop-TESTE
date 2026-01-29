@@ -3,10 +3,15 @@ import { SPECIAL_GROUPS } from '../constants';
 
 // --- Helpers de Utilidade ---
 
+/**
+ * Converte valores de data da planilha (string ou número Excel) para objetos Date.
+ * Suporta o formato brasileiro DD/MM/YYYY.
+ */
 const safeDate = (dStr: string | number | undefined): Date | null => {
     if (dStr === undefined || dStr === null) return null;
     
     if (typeof dStr === 'number') {
+        // Conversão de data serial do Excel (dias desde 1900)
         const d = new Date(Math.round((dStr - 25569) * 86400 * 1000));
         return isNaN(d.getTime()) ? null : d;
     }
@@ -15,6 +20,7 @@ const safeDate = (dStr: string | number | undefined): Date | null => {
         const cleanStr = dStr.trim();
         if (cleanStr === '') return null;
         
+        // Trata formato DD/MM/YYYY
         if (cleanStr.includes('/')) {
             const parts = cleanStr.split('/');
             if (parts.length === 3) {
@@ -31,6 +37,9 @@ const safeDate = (dStr: string | number | undefined): Date | null => {
     return null;
 };
 
+/**
+ * Limpa e converte valores numéricos da planilha, tratando vírgulas como pontos decimais.
+ */
 const parsePFRNumber = (val: any): number => {
     if (val === undefined || val === null || val === '') return 0;
     if (typeof val === 'number') return val;
@@ -39,17 +48,24 @@ const parsePFRNumber = (val: any): number => {
     return isNaN(parsed) ? 0 : parsed;
 };
 
+/**
+ * Identifica o plantão mais recente (Art. 4, III e Art. 12, § 2º) entre várias colunas.
+ */
 const calculateRecency = (dates: (string | number | undefined)[]): Date | null => {
-    let max: Date | null = null;
+    let maxDate: Date | null = null;
     dates.forEach(dVal => {
         const d = safeDate(dVal);
         if (d) {
-            if (!max || d > max) max = d;
+            if (!maxDate || d > maxDate) maxDate = d;
         }
     });
-    return max;
+    return maxDate;
 };
 
+/**
+ * Normaliza os nomes das colunas (chaves) para minúsculas, sem espaços e sem acentos.
+ * Isso remove a sensibilidade a Case Sensitive (Maiúsculas/Minúsculas).
+ */
 const normalizeRow = (row: Record<string, any>): Record<string, any> => {
     const newRow: Record<string, any> = {};
     Object.keys(row).forEach(key => {
@@ -66,14 +82,17 @@ const normalizeRow = (row: Record<string, any>): Record<string, any> => {
 // --- Pipeline Principal de Dados ---
 
 export const mergeData = (inputs: SheetData): Officer[] => {
+    // 1. Normalização dos Dataframes (Ignora Case Sensitive e Acentos)
     const opsData = inputs.operacional.map(normalizeRow);
     const origemData = inputs.origem.map(normalizeRow);
     const externaData = inputs.externas.map(normalizeRow);
     const restricaoData = inputs.restricoes.map(normalizeRow);
 
+    // 2. Indexação para Cruzamento Rápido (Merge) pela Matrícula
     const origemMap = new Map(origemData.map(i => [String(i['matricula'] || '').trim(), i]));
     const missionMap = new Map(externaData.map(i => [String(i['matricula'] || '').trim(), i]));
     
+    // Filtragem de restrições (remove entradas vazias para evitar falsos positivos)
     const restrictedMatriculas = restricaoData
         .map(i => String(i['matricula'] || '').trim())
         .filter(m => m.length > 0);
@@ -81,28 +100,35 @@ export const mergeData = (inputs: SheetData): Officer[] => {
 
     const officers: Officer[] = [];
 
+    // VISÃO 1: Horas Operacionais (Base: Aba 'Hrs Operacionais - Frequência')
     opsData.forEach((op, index) => {
         const mat = String(op['matricula'] || '').trim();
         if (!mat) return; 
 
+        // VISÃO 2 & 3: Dados de IFR e Recência (Fonte: Aba 'Origem')
         const origem = origemMap.get(mat) || {};
         const chIfr = parsePFRNumber(origem['carga horaria ifr']);
         const qtd12h = parseInt(String(origem['qtd ifr - 12h'] || '0'), 10);
 
+        // Identifica automaticamente o plantão mais recente (Data1 a Data4)
         const dateColumns = [origem['data1'], origem['data2'], origem['data3'], origem['data4']];
         const maxIfrDate = calculateRecency(dateColumns);
 
+        // VISÃO 4: Convocações Externas (Fonte: Aba 'Convocações Externas')
         const mission = missionMap.get(mat);
         const lastMissionDate = safeDate(mission?.['data fim']);
         
         let inQuarantine = false;
         if (lastMissionDate) {
+            // Regra dos 180 dias (Art. 8º da IS 16/2026)
             const daysSince = (new Date().getTime() - lastMissionDate.getTime()) / (1000 * 3600 * 24);
             if (daysSince < 180) inQuarantine = true;
         }
 
+        // VISÃO 5: Restrições (Fonte: Aba 'Restrições')
         const isRestricted = restrictionSet.has(mat);
 
+        // Lógica de Lotação e Grupos
         const rawLotacao = (op['lotacao'] || '').toUpperCase();
         let group = '';
         SPECIAL_GROUPS.forEach(g => {
@@ -114,6 +140,7 @@ export const mergeData = (inputs: SheetData): Officer[] => {
             type = UnitType.DELEGACIA;
         }
 
+        // Captura o valor de Horas Operacionais (Normalizado)
         const hOps = parsePFRNumber(op['horas operacional'] || op['horas operacionais']);
 
         officers.push({
@@ -150,22 +177,29 @@ const compareDatesDesc = (a: Date | null, b: Date | null) => {
 
 const sortRegional = (candidates: Officer[]) => {
     candidates.sort((a, b) => {
+        // 1. Menor Horas Operacionais (Art. 12)
         if (a.horas_operacionais !== b.horas_operacionais) return a.horas_operacionais - b.horas_operacionais; 
+        // 2. Maior IFR (Desempate)
         if (b.carga_horaria_ifr !== a.carga_horaria_ifr) return b.carga_horaria_ifr - a.carga_horaria_ifr; 
+        // 3. Maior QTD 12h
         if (b.qtd_ifr_12h !== a.qtd_ifr_12h) return b.qtd_ifr_12h - a.qtd_ifr_12h; 
+        // 4. Data de IFR mais recente
         return compareDatesDesc(a.data_ultimo_ifr, b.data_ultimo_ifr);
     });
 };
 
 const sortNational = (candidates: Officer[]) => {
     candidates.sort((a, b) => {
+        // 1. Maior IFR (Art. 4)
         if (b.carga_horaria_ifr !== a.carga_horaria_ifr) return b.carga_horaria_ifr - a.carga_horaria_ifr; 
+        // 2. Maior QTD 12h
         if (b.qtd_ifr_12h !== a.qtd_ifr_12h) return b.qtd_ifr_12h - a.qtd_ifr_12h; 
+        // 3. Data de IFR mais recente (Recência Automática)
         return compareDatesDesc(a.data_ultimo_ifr, b.data_ultimo_ifr);
     });
 };
 
-// --- Execução do Ranking e Restrições de Cota ---
+// --- Ranking e Restrições de Cota ---
 
 export const runSelectionProcess = (
     allOfficers: Officer[], 
@@ -178,19 +212,21 @@ export const runSelectionProcess = (
     const unitCounts: Record<string, number> = {};
     const groupCounts: Record<string, number> = {};
 
+    // 1. Filtragem Inicial (Restrições e Quarentena)
     let candidates = allOfficers.filter(o => {
         if (o.restricao) {
-            logs.push({ matricula: o.matricula, nome: o.nome, status: 'skipped', reason: 'Filtro: Servidor consta na aba de Restrições' });
+            logs.push({ matricula: o.matricula, nome: o.nome, status: 'skipped', reason: 'Impedido: Consta na aba de Restrições' });
             return false;
         }
 
         if (config.missionType === MissionType.NATIONAL && o.em_quarentena) {
-            logs.push({ matricula: o.matricula, nome: o.nome, status: 'skipped', reason: 'Interstício: Convocado de ofício há menos de 180 dias (Art. 8º)' });
+            logs.push({ matricula: o.matricula, nome: o.nome, status: 'skipped', reason: 'Impedido: Interstício < 180 dias (Art. 8º)' });
             return false;
         }
         return true;
     });
 
+    // 2. Ordenação
     if (config.missionType === MissionType.REGIONAL) {
         sortRegional(candidates);
     } else {
@@ -200,7 +236,7 @@ export const runSelectionProcess = (
     const attemptAddOfficer = (off: Officer, method: 'ranking' | 'group_integrity', reason: string): boolean => {
         if (selectedIds.has(off.id)) return false;
 
-        // --- ART. 7º § 1º: A limitação de cota NÃO se aplica a grupos especializados (Art. 5º) ---
+        // Regra de Cotas (Art. 7º § 1º: Não se aplica a grupos especializados)
         const isSpecialized = off.grupo_especial && SPECIAL_GROUPS.includes(off.grupo_especial);
         
         if (!isSpecialized) {
@@ -208,7 +244,7 @@ export const runSelectionProcess = (
             const current = unitCounts[off.unidade] || 0;
 
             if (current >= limit) {
-                 logs.push({ matricula: off.matricula, nome: off.nome, status: 'skipped', reason: `Limite de Unidade Atingido (${off.unidade}: ${limit} vaga(s))` });
+                 logs.push({ matricula: off.matricula, nome: off.nome, status: 'skipped', reason: `Limite Unidade (${off.unidade}): ${limit} vaga(s) preenchida(s)` });
                  return false;
             }
             unitCounts[off.unidade] = current + 1;
@@ -231,7 +267,7 @@ export const runSelectionProcess = (
         return true;
     };
 
-    // Processamento do Ranking
+    // 3. Loop de Seleção
     for (const candidate of candidates) {
         if (selected.length >= config.numVagas) break;
         if (selectedIds.has(candidate.id)) continue;
@@ -247,23 +283,22 @@ export const runSelectionProcess = (
 
         const added = attemptAddOfficer(candidate, 'ranking', reason);
 
-        // --- ART. 5º: Lógica de Mobilização Coletiva (Equipes) ---
+        // ART. 5º: Integridade das Equipes Especializadas (NOE, GOC, GMP, GPT, GFT)
         if (added && candidate.grupo_especial && SPECIAL_GROUPS.includes(candidate.grupo_especial)) {
             const grp = candidate.grupo_especial;
             
-            // Se atingir 2 membros do mesmo grupo, "puxa" o restante da equipe
+            // Se o sistema selecionar 2 membros, puxa automaticamente o restante da equipe (até 4 membros)
             if (groupCounts[grp] === 2) {
                 const teamMates = candidates.filter(c => 
                     c.grupo_especial === grp && 
                     !selectedIds.has(c.id)
                 );
 
-                // Tenta adicionar até completar a equipa (máximo 4 membros no total por grupo ou até acabar as vagas)
                 for (const mate of teamMates) {
                     if (groupCounts[grp] >= 4) break; 
                     if (selected.length >= config.numVagas) break; 
 
-                    attemptAddOfficer(mate, 'group_integrity', `Integridade de Equipa ${grp} (Art. 5º)`);
+                    attemptAddOfficer(mate, 'group_integrity', `Mobilização Coletiva ${grp} (Art. 5º)`);
                 }
             }
         }
