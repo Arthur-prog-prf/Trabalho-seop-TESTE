@@ -3,10 +3,6 @@ import { SPECIAL_GROUPS } from '../constants';
 
 // --- Helpers de Utilidade ---
 
-/**
- * Converte strings de data ou números do Excel para objetos Date.
- * Lida com o formato brasileiro DD/MM/YYYY.
- */
 const safeDate = (dStr: string | number | undefined): Date | null => {
     if (dStr === undefined || dStr === null) return null;
     
@@ -35,10 +31,6 @@ const safeDate = (dStr: string | number | undefined): Date | null => {
     return null;
 };
 
-/**
- * Limpa e converte valores numéricos da planilha para Float.
- * Lida com separadores de milhar e decimais (converte vírgula para ponto).
- */
 const parsePFRNumber = (val: any): number => {
     if (val === undefined || val === null || val === '') return 0;
     if (typeof val === 'number') return val;
@@ -47,9 +39,6 @@ const parsePFRNumber = (val: any): number => {
     return isNaN(parsed) ? 0 : parsed;
 };
 
-/**
- * Calcula a data mais recente entre várias colunas de data (Lógica da Visão 3).
- */
 const calculateRecency = (dates: (string | number | undefined)[]): Date | null => {
     let max: Date | null = null;
     dates.forEach(dVal => {
@@ -61,10 +50,6 @@ const calculateRecency = (dates: (string | number | undefined)[]): Date | null =
     return max;
 };
 
-/**
- * Normaliza as chaves das linhas para minúsculas e sem acentos.
- * Garante que 'Matrícula' e 'matricula' sejam lidas como o mesmo campo.
- */
 const normalizeRow = (row: Record<string, any>): Record<string, any> => {
     const newRow: Record<string, any> = {};
     Object.keys(row).forEach(key => {
@@ -81,18 +66,14 @@ const normalizeRow = (row: Record<string, any>): Record<string, any> => {
 // --- Pipeline Principal de Dados ---
 
 export const mergeData = (inputs: SheetData): Officer[] => {
-    // 1. Normalização das entradas
     const opsData = inputs.operacional.map(normalizeRow);
     const origemData = inputs.origem.map(normalizeRow);
     const externaData = inputs.externas.map(normalizeRow);
     const restricaoData = inputs.restricoes.map(normalizeRow);
 
-    // 2. Indexação e Criação de Conjuntos de Busca (Map/Set)
-    // CRÍTICO: String() e trim() garantem que a matrícula seja comparada corretamente.
     const origemMap = new Map(origemData.map(i => [String(i['matricula'] || '').trim(), i]));
     const missionMap = new Map(externaData.map(i => [String(i['matricula'] || '').trim(), i]));
     
-    // CORREÇÃO PANE 1: Filtrar matrículas vazias para evitar restrições falsas em massa
     const restrictedMatriculas = restricaoData
         .map(i => String(i['matricula'] || '').trim())
         .filter(m => m.length > 0);
@@ -100,12 +81,10 @@ export const mergeData = (inputs: SheetData): Officer[] => {
 
     const officers: Officer[] = [];
 
-    // VIEW 1: Horas Operacionais (Base: Hrs Operacionais - Frequência)
     opsData.forEach((op, index) => {
         const mat = String(op['matricula'] || '').trim();
         if (!mat) return; 
 
-        // VIEW 2 & 3: Dados de IFR e Recência (Fonte: Origem)
         const origem = origemMap.get(mat) || {};
         const chIfr = parsePFRNumber(origem['carga horaria ifr']);
         const qtd12h = parseInt(String(origem['qtd ifr - 12h'] || '0'), 10);
@@ -113,7 +92,6 @@ export const mergeData = (inputs: SheetData): Officer[] => {
         const dateColumns = [origem['data1'], origem['data2'], origem['data3'], origem['data4']];
         const maxIfrDate = calculateRecency(dateColumns);
 
-        // VIEW 4: Histórico (Fonte: Convocações Externas)
         const mission = missionMap.get(mat);
         const lastMissionDate = safeDate(mission?.['data fim']);
         
@@ -123,10 +101,8 @@ export const mergeData = (inputs: SheetData): Officer[] => {
             if (daysSince < 180) inQuarantine = true;
         }
 
-        // VIEW 5: Verificação de Restrição
         const isRestricted = restrictionSet.has(mat);
 
-        // Identificação de Grupo e Unidade
         const rawLotacao = (op['lotacao'] || '').toUpperCase();
         let group = '';
         SPECIAL_GROUPS.forEach(g => {
@@ -138,7 +114,6 @@ export const mergeData = (inputs: SheetData): Officer[] => {
             type = UnitType.DELEGACIA;
         }
 
-        // CORREÇÃO PANE 2: Verificação robusta de nomes de colunas (singular/plural)
         const hOps = parsePFRNumber(op['horas operacional'] || op['horas operacionais']);
 
         officers.push({
@@ -175,24 +150,17 @@ const compareDatesDesc = (a: Date | null, b: Date | null) => {
 
 const sortRegional = (candidates: Officer[]) => {
     candidates.sort((a, b) => {
-        // 1. Menor Horas Ops (Art. 12)
         if (a.horas_operacionais !== b.horas_operacionais) return a.horas_operacionais - b.horas_operacionais; 
-        // 2. Maior IFR
         if (b.carga_horaria_ifr !== a.carga_horaria_ifr) return b.carga_horaria_ifr - a.carga_horaria_ifr; 
-        // 3. Maior QTD 12h
         if (b.qtd_ifr_12h !== a.qtd_ifr_12h) return b.qtd_ifr_12h - a.qtd_ifr_12h; 
-        // 4. Data mais recente
         return compareDatesDesc(a.data_ultimo_ifr, b.data_ultimo_ifr);
     });
 };
 
 const sortNational = (candidates: Officer[]) => {
     candidates.sort((a, b) => {
-        // 1. Maior IFR (Art. 4)
         if (b.carga_horaria_ifr !== a.carga_horaria_ifr) return b.carga_horaria_ifr - a.carga_horaria_ifr; 
-        // 2. Maior QTD 12h
         if (b.qtd_ifr_12h !== a.qtd_ifr_12h) return b.qtd_ifr_12h - a.qtd_ifr_12h; 
-        // 3. Data mais recente
         return compareDatesDesc(a.data_ultimo_ifr, b.data_ultimo_ifr);
     });
 };
@@ -210,7 +178,6 @@ export const runSelectionProcess = (
     const unitCounts: Record<string, number> = {};
     const groupCounts: Record<string, number> = {};
 
-    // 1. Filtragem Inicial de Disponibilidade
     let candidates = allOfficers.filter(o => {
         if (o.restricao) {
             logs.push({ matricula: o.matricula, nome: o.nome, status: 'skipped', reason: 'Filtro: Servidor consta na aba de Restrições' });
@@ -224,40 +191,47 @@ export const runSelectionProcess = (
         return true;
     });
 
-    // 2. Ordenação segundo o Modo de Missão
     if (config.missionType === MissionType.REGIONAL) {
         sortRegional(candidates);
     } else {
         sortNational(candidates);
     }
 
-    // Helper para tentativa de adição
     const attemptAddOfficer = (off: Officer, method: 'ranking' | 'group_integrity', reason: string): boolean => {
         if (selectedIds.has(off.id)) return false;
 
-        // Regra de Cotas (Art. 7º)
-        const limit = off.tipo_unidade === UnitType.DELEGACIA ? 2 : 1;
-        const current = unitCounts[off.unidade] || 0;
+        // --- ART. 7º § 1º: A limitação de cota NÃO se aplica a grupos especializados (Art. 5º) ---
+        const isSpecialized = off.grupo_especial && SPECIAL_GROUPS.includes(off.grupo_especial);
+        
+        if (!isSpecialized) {
+            const limit = off.tipo_unidade === UnitType.DELEGACIA ? 2 : 1;
+            const current = unitCounts[off.unidade] || 0;
 
-        if (current >= limit) {
-             logs.push({ matricula: off.matricula, nome: off.nome, status: 'skipped', reason: `Limite de Unidade Atingido (${off.unidade}: ${limit} vaga(s))` });
-             return false;
+            if (current >= limit) {
+                 logs.push({ matricula: off.matricula, nome: off.nome, status: 'skipped', reason: `Limite de Unidade Atingido (${off.unidade}: ${limit} vaga(s))` });
+                 return false;
+            }
+            unitCounts[off.unidade] = current + 1;
         }
 
         off.justificativa = reason;
         selected.push(off);
         selectedIds.add(off.id);
         
-        unitCounts[off.unidade] = current + 1;
-        if (off.grupo_especial && SPECIAL_GROUPS.includes(off.grupo_especial)) {
+        if (isSpecialized) {
             groupCounts[off.grupo_especial] = (groupCounts[off.grupo_especial] || 0) + 1;
         }
 
-        logs.push({ matricula: off.matricula, nome: off.nome, status: method === 'ranking' ? 'selected' : 'forced', reason });
+        logs.push({ 
+            matricula: off.matricula, 
+            nome: off.nome, 
+            status: method === 'ranking' ? 'selected' : 'forced', 
+            reason: isSpecialized && method === 'ranking' ? `${reason} (Isento de Cota)` : reason 
+        });
         return true;
     };
 
-    // 3. Processamento do Ranking
+    // Processamento do Ranking
     for (const candidate of candidates) {
         if (selected.length >= config.numVagas) break;
         if (selectedIds.has(candidate.id)) continue;
@@ -271,7 +245,28 @@ export const runSelectionProcess = (
             reason = `Maior IFR (${candidate.carga_horaria_ifr}h) | Turnos 12h: ${candidate.qtd_ifr_12h} | Plantão: ${dataFmt}`;
         }
 
-        attemptAddOfficer(candidate, 'ranking', reason);
+        const added = attemptAddOfficer(candidate, 'ranking', reason);
+
+        // --- ART. 5º: Lógica de Mobilização Coletiva (Equipes) ---
+        if (added && candidate.grupo_especial && SPECIAL_GROUPS.includes(candidate.grupo_especial)) {
+            const grp = candidate.grupo_especial;
+            
+            // Se atingir 2 membros do mesmo grupo, "puxa" o restante da equipe
+            if (groupCounts[grp] === 2) {
+                const teamMates = candidates.filter(c => 
+                    c.grupo_especial === grp && 
+                    !selectedIds.has(c.id)
+                );
+
+                // Tenta adicionar até completar a equipa (máximo 4 membros no total por grupo ou até acabar as vagas)
+                for (const mate of teamMates) {
+                    if (groupCounts[grp] >= 4) break; 
+                    if (selected.length >= config.numVagas) break; 
+
+                    attemptAddOfficer(mate, 'group_integrity', `Integridade de Equipa ${grp} (Art. 5º)`);
+                }
+            }
+        }
     }
 
     return { selected, auditLogs: logs };
